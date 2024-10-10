@@ -816,7 +816,7 @@ def test_rolling_min_max_sum_bool() -> None:
         s.rolling_max(2), pl.Series("a", [None, True, True, False, True, None])
     )
     assert_series_equal(
-        s.rolling_sum(2), pl.Series("a", [None, 2, 1, 0, 1, None], dtype=pl.UInt32)
+        s.rolling_sum(2), pl.Series("a", [None, 2, 1, 0, 1, None], dtype=pl.get_index_type())
     )
 
 
@@ -857,7 +857,7 @@ def test_rolling_min_max_sum_bool_by_date_bool() -> None:
     )
     assert_frame_equal(
         df.with_columns(roll=pl.col("val").rolling_sum_by("dt", "2d")),
-        df.with_columns(pl.Series("roll", [1, 2, 1, 0, 1], dtype=pl.UInt32)),
+        df.with_columns(pl.Series("roll", [1, 2, 1, 0, 1], dtype=pl.get_index_type())),
     )
 
 
