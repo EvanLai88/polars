@@ -808,6 +808,17 @@ def test_rolling() -> None:
 
 
 def test_rolling_min_max_sum_bool() -> None:
+    s = pl.Series("a", [True, True, False, False, True])
+    assert_series_equal(
+        s.rolling_min(2), pl.Series("a", [None, True, False, False, False])
+    )
+    assert_series_equal(
+        s.rolling_max(2), pl.Series("a", [None, True, True, False, True])
+    )
+    assert_series_equal(
+        s.rolling_sum(2), pl.Series("a", [None, 2, 1, 0, 1], dtype=pl.get_index_type())
+    )
+
     s = pl.Series("a", [True, True, False, False, True, None])
     assert_series_equal(
         s.rolling_min(2), pl.Series("a", [None, True, False, False, False, None])

@@ -11,6 +11,7 @@ pub use sum::*;
 pub use variance::*;
 
 use super::*;
+use crate::datatypes::ArrowDataType;
 
 pub trait RollingAggWindowNulls<'a, T: NativeType> {
     /// # Safety
@@ -26,6 +27,23 @@ pub trait RollingAggWindowNulls<'a, T: NativeType> {
     /// # Safety
     /// `start` and `end` must be in bounds of `slice` and `bitmap`
     unsafe fn update(&mut self, start: usize, end: usize) -> Option<T>;
+
+    fn is_valid(&self, min_periods: usize) -> bool;
+}
+
+pub trait RollingAggWindowBoolNulls<'a> {
+    /// # Safety
+    /// `start` and `end` must be in bounds for `slice` and `validity`
+    unsafe fn new(
+        slice: &'a Bitmap,
+        validity: &'a Bitmap,
+        start: usize,
+        end: usize,
+    ) -> Self;
+
+    /// # Safety
+    /// `start` and `end` must be in bounds of `slice` and `bitmap`
+    unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool>;
 
     fn is_valid(&self, min_periods: usize) -> bool;
 }
@@ -83,6 +101,61 @@ where
 
     Box::new(PrimitiveArray::new(
         T::PRIMITIVE.into(),
+        out.into(),
+        Some(validity.into()),
+    ))
+}
+
+pub(super) fn rolling_apply_agg_window_bool<'a, Agg, Fo>(
+    values: &'a Bitmap,
+    validity: &'a Bitmap,
+    window_size: usize,
+    min_periods: usize,
+    det_offsets_fn: Fo,
+) -> ArrayRef
+where
+    Fo: Fn(Idx, WindowSize, Len) -> (Start, End) + Copy,
+    Agg: RollingAggWindowBoolNulls<'a>,
+{
+    let len = values.len();
+    let (start, end) = det_offsets_fn(0, window_size, len);
+    // SAFETY; we are in bounds
+    let mut agg_window = unsafe { Agg::new(values, validity, start, end) };
+
+    let mut validity = create_validity(min_periods, len, window_size, det_offsets_fn)
+        .unwrap_or_else(|| {
+            let mut validity = MutableBitmap::with_capacity(len);
+            validity.extend_constant(len, true);
+            validity
+        });
+
+    let out = (0..len)
+        .map(|idx| {
+            let (start, end) = det_offsets_fn(idx, window_size, len);
+            // SAFETY:
+            // we are in bounds
+            let agg = unsafe { agg_window.update(start, end) };
+            match agg {
+                Some(val) => {
+                    if agg_window.is_valid(min_periods) {
+                        val
+                    } else {
+                        // SAFETY: we are in bounds
+                        unsafe { validity.set_unchecked(idx, false) };
+                        bool::default()
+                    }
+                },
+                None => {
+                    // SAFETY: we are in bounds
+                    unsafe { validity.set_unchecked(idx, false) };
+                    bool::default()
+                },
+            }
+        })
+        .collect_trusted::<Vec<_>>();
+
+    Box::new(BooleanArray::new(
+        ArrowDataType::Boolean,
         out.into(),
         Some(validity.into()),
     ))

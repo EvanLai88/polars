@@ -1,13 +1,25 @@
 use super::*;
 
 #[inline]
-fn new_is_min<T: NativeType + IsFloat + PartialOrd>(old: &T, new: &T) -> bool {
+fn new_is_min<T: IsFloat + PartialOrd>(old: &T, new: &T) -> bool {
     compare_fn_nan_min(old, new).is_ge()
 }
 
 #[inline]
-fn new_is_max<T: NativeType + IsFloat + PartialOrd>(old: &T, new: &T) -> bool {
+fn new_is_min_bool(old: bool, new: bool) -> bool {
+    compare_fn_nan_min(&old, &new).is_ge()
+    // old | !new
+}
+
+#[inline]
+fn new_is_max<T: IsFloat + PartialOrd>(old: &T, new: &T) -> bool {
     compare_fn_nan_max(old, new).is_le()
+}
+
+#[inline]
+fn new_is_max_bool(old: bool, new: bool) -> bool {
+    compare_fn_nan_max(&old, &new).is_le()
+    // !old | new
 }
 
 #[inline]
@@ -54,6 +66,59 @@ where
 }
 
 #[inline]
+unsafe fn get_min_and_idx_bool(
+    bitmap: &Bitmap,
+    start: usize,
+    end: usize,
+    sorted_to: usize,
+) -> Option<(usize, bool)> {
+    if sorted_to >= end {
+        Some((start, bitmap.get_bit_unchecked(start)))
+    } else if sorted_to <= start {
+        // let slice = bitmap.clone().sliced_unchecked(start, end - start);
+        // match slice.not().true_idx_iter().last() {
+        //     Some(idx) => Some((start + idx, false)),
+        //     None => Some((end, true)),
+        // }
+        bitmap
+            .clone()
+            .sliced_unchecked(start, end - start)
+            .iter()
+            .enumerate()
+            .rev()
+            .min_by(|&a, &b| compare_fn_nan_min(&(a.1), &(b.1)))
+            .map(|v| (v.0 + start, v.1))
+    } else {
+        let s = (start, bitmap.get_bit_unchecked(start));
+        // let slice = bitmap.clone().sliced_unchecked(start, end - start);
+        // match slice.not().true_idx_iter().last() {
+        //     Some(idx) => Some((sorted_to + idx, false)),
+        //     None => {
+        //         if new_is_min_bool(s.1, true) {
+        //             Some((end, true))
+        //         } else {
+        //             Some(s)
+        //         }
+        //     },
+        // }
+        bitmap
+            .clone()
+            .sliced_unchecked(start, end - start)
+            .iter()
+            .enumerate()
+            .rev()
+            .min_by(|&a, &b| compare_fn_nan_min(&(a.1), &(b.1)))
+            .map(|v| {
+                if new_is_min(&(s.1), &(v.1)) {
+                    (v.0 + sorted_to, v.1)
+                } else {
+                    s
+                }
+            })
+    }
+}
+
+#[inline]
 unsafe fn get_max_and_idx<T>(
     slice: &[T],
     start: usize,
@@ -90,6 +155,57 @@ where
 }
 
 #[inline]
+unsafe fn get_max_and_idx_bool(
+    bitmap: &Bitmap,
+    start: usize,
+    end: usize,
+    sorted_to: usize,
+) -> Option<(usize, bool)> {
+    if sorted_to >= end {
+        Some((start, bitmap.get_bit_unchecked(start)))
+    } else if sorted_to <= start {
+        // let slice = bitmap.clone().sliced_unchecked(start, end - start);
+        // match slice.true_idx_iter().last() {
+        //     Some(idx) => Some((start + idx, true)),
+        //     None => Some((end, false)),
+        // }
+        bitmap
+            .clone()
+            .sliced_unchecked(start, end - start)
+            .iter()
+            .enumerate()
+            .max_by(|&a, &b| compare_fn_nan_max(&(a.1), &(b.1)))
+            .map(|v| (v.0 + start, v.1))
+    } else {
+        let s = (start, bitmap.get_bit_unchecked(start));
+        // let slice = bitmap.clone().sliced_unchecked(start, end - start);
+        // match slice.true_idx_iter().last() {
+        //     Some(idx) => Some((sorted_to + idx, true)),
+        //     None => {
+        //         if new_is_max_bool(s.1, false) {
+        //             Some((end, false))
+        //         } else {
+        //             Some(s)
+        //         }
+        //     },
+        // }
+        bitmap
+            .clone()
+            .sliced_unchecked(start, end - start)
+            .iter()
+            .enumerate()
+            .max_by(|&a, &b| compare_fn_nan_max(&(a.1), &(b.1)))
+            .map(|v| {
+                if new_is_max(&(s.1), &(v.1)) {
+                    (v.0 + sorted_to, v.1)
+                } else {
+                    s
+                }
+            })
+    }
+}
+
+#[inline]
 fn n_sorted_past_min<T: NativeType + IsFloat + PartialOrd>(slice: &[T]) -> usize {
     slice
         .windows(2)
@@ -98,11 +214,39 @@ fn n_sorted_past_min<T: NativeType + IsFloat + PartialOrd>(slice: &[T]) -> usize
 }
 
 #[inline]
+fn n_sorted_past_min_bool(bitmap: &Bitmap) -> usize {
+    let mut iter = bitmap.iter();
+
+    match unsafe { bitmap.get_bit_unchecked(0) } {
+        true => iter.take_leading_ones(),
+        false => {
+            let leading_zeros = iter.take_leading_zeros();
+            let trailing_ones = iter.take_leading_ones();
+            leading_zeros + trailing_ones
+        },
+    }
+}
+
+#[inline]
 fn n_sorted_past_max<T: NativeType + IsFloat + PartialOrd>(slice: &[T]) -> usize {
     slice
         .windows(2)
         .position(|x| compare_fn_nan_max(&x[0], &x[1]).is_lt())
         .unwrap_or(slice.len() - 1)
+}
+
+#[inline]
+fn n_sorted_past_max_bool(bitmap: &Bitmap) -> usize {
+    let mut iter = bitmap.iter();
+
+    match unsafe { bitmap.get_bit_unchecked(0) } {
+        true => {
+            let leading_ones = iter.take_leading_ones();
+            let trailing_zeros = iter.take_leading_zeros();
+            leading_ones + trailing_zeros
+        },
+        false => iter.take_leading_zeros(),
+    }
 }
 
 // Min and max really are the same thing up to a difference in comparison direction, as represented
@@ -205,6 +349,108 @@ macro_rules! minmax_window {
 minmax_window!(MinWindow, get_min_and_idx, new_is_min, n_sorted_past_min);
 minmax_window!(MaxWindow, get_max_and_idx, new_is_max, n_sorted_past_max);
 
+macro_rules! minmax_window_bool {
+    ($m_window_bool:tt, $get_m_and_idx:ident, $new_is_m:ident, $n_sorted_past:ident) => {
+        pub struct $m_window_bool<'a> {
+            bitmap: &'a Bitmap,
+            m: bool,
+            m_idx: usize,
+            sorted_to: usize,
+            last_start: usize,
+            last_end: usize,
+        }
+
+        impl<'a> $m_window_bool<'a> {
+            #[inline]
+            unsafe fn update_m_and_m_idx(&mut self, m_and_idx: (usize, bool)) {
+                self.m = m_and_idx.1;
+                self.m_idx = m_and_idx.0;
+                if self.sorted_to <= self.m_idx {
+                    let slice = self
+                        .bitmap
+                        .clone()
+                        .sliced_unchecked(self.m_idx, self.bitmap.len() - self.m_idx);
+                    self.sorted_to = self.m_idx + $n_sorted_past(&slice);
+                }
+            }
+        }
+
+        impl<'a> RollingAggWindowBoolNoNulls<'a> for $m_window_bool<'a> {
+            fn new(bitmap: &'a Bitmap, start: usize, end: usize) -> Self {
+                let (idx, m) = unsafe {
+                    $get_m_and_idx(bitmap, start, end, 0)
+                        .unwrap_or((0, bitmap.get_bit_unchecked(start)))
+                };
+                let slice = unsafe { bitmap.clone().sliced_unchecked(idx, bitmap.len() - idx) };
+                Self {
+                    bitmap,
+                    m: m,
+                    m_idx: idx,
+                    sorted_to: idx + $n_sorted_past(&slice),
+                    last_start: start,
+                    last_end: end,
+                }
+            }
+
+            unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool> {
+                self.last_start = start;
+                let old_last_end = self.last_end;
+                self.last_end = end;
+                let entering_start = std::cmp::max(old_last_end, start);
+                let entering = if end - entering_start == 1 {
+                    Some((
+                        entering_start,
+                        self.bitmap.get_bit_unchecked(entering_start),
+                    ))
+                } else if old_last_end == end {
+                    None
+                } else {
+                    $get_m_and_idx(self.bitmap, entering_start, end, self.sorted_to)
+                };
+                let empty_overlap = old_last_end <= start;
+
+                if entering.map(|em| $new_is_m(self.m, em.1) || empty_overlap) == Some(true) {
+                    self.update_m_and_m_idx(entering.unwrap());
+                    return Some(self.m);
+                } else if self.m_idx >= start || empty_overlap {
+                    return Some(self.m);
+                }
+
+                match (
+                    $get_m_and_idx(self.bitmap, start, old_last_end, self.sorted_to),
+                    entering,
+                ) {
+                    (Some(pm), Some(em)) => {
+                        if $new_is_m(pm.1, em.1) {
+                            self.update_m_and_m_idx(em);
+                        } else {
+                            self.update_m_and_m_idx(pm);
+                        }
+                    },
+                    (Some(pm), None) => self.update_m_and_m_idx(pm),
+                    (None, Some(em)) => self.update_m_and_m_idx(em),
+                    (None, None) => unreachable!(),
+                }
+
+                Some(self.m)
+            }
+        }
+    };
+}
+
+minmax_window_bool!(
+    MinWindowBool,
+    get_min_and_idx_bool,
+    new_is_min_bool,
+    n_sorted_past_min_bool
+);
+minmax_window_bool!(
+    MaxWindowBool,
+    get_max_and_idx_bool,
+    new_is_max_bool,
+    n_sorted_past_max_bool
+);
+
 pub(crate) fn compute_min_weights<T>(values: &[T], weights: &[T]) -> T
 where
     T: NativeType + PartialOrd + std::ops::Mul<Output = T>,
@@ -286,6 +532,32 @@ macro_rules! rolling_minmax_func {
 rolling_minmax_func!(rolling_min, MinWindow, compute_min_weights);
 rolling_minmax_func!(rolling_max, MaxWindow, compute_max_weights);
 
+// weights are handled by rolling_minmax
+macro_rules! rolling_minmax_func_bool {
+    ($rolling_m_bool:ident, $window_bool:tt) => {
+        pub fn $rolling_m_bool(
+            arr: &Bitmap,
+            window_size: usize,
+            min_periods: usize,
+            center: bool,
+        ) -> PolarsResult<ArrayRef> {
+            let offset_fn = match center {
+                true => det_offsets_center,
+                false => det_offsets,
+            };
+            rolling_apply_agg_window_bool::<$window_bool, _>(
+                arr,
+                window_size,
+                min_periods,
+                offset_fn,
+            )
+        }
+    };
+}
+
+rolling_minmax_func_bool!(rolling_min_bool, MinWindowBool);
+rolling_minmax_func_bool!(rolling_max_bool, MaxWindowBool);
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -357,5 +629,36 @@ mod test {
                 ]
             )
         );
+        // test bool
+        let values = Bitmap::from([true, true, false, false, true]);
+
+        let out = rolling_min_bool(&values, 2, 2, false).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let out = out.into_iter().collect::<Vec<_>>();
+        assert_eq!(out, &[None, Some(true), Some(false), Some(false), Some(false)]);
+        let out = rolling_max_bool(&values, 2, 2, false).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let out = out.into_iter().collect::<Vec<_>>();
+        assert_eq!(out, &[None, Some(true), Some(true), Some(false), Some(true)]);
+
+        let out = rolling_min_bool(&values, 2, 1, false).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let out = out.into_iter().collect::<Vec<_>>();
+        assert_eq!(out, &[Some(true), Some(true), Some(false), Some(false), Some(false)]);
+        let out = rolling_max_bool(&values, 2, 1, false).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let out = out.into_iter().collect::<Vec<_>>();
+        assert_eq!(out, &[Some(true), Some(true), Some(true), Some(false), Some(true)]);
+
+        let out = rolling_min_bool(&values, 3, 1, false).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let out = out.into_iter().collect::<Vec<_>>();
+        assert_eq!(out, &[Some(true), Some(true), Some(false), Some(false), Some(false)]);
+        let out = rolling_max_bool(&values, 3, 1, false).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let out = out.into_iter().collect::<Vec<_>>();
+        assert_eq!(out, &[Some(true), Some(true), Some(true), Some(true), Some(true)]);
+
     }
+    
 }

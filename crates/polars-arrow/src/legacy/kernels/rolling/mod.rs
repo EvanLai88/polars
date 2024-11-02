@@ -3,7 +3,7 @@ pub mod nulls;
 pub mod quantile_filter;
 mod window;
 
-use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Not, Mul, Sub, SubAssign};
 
 use num_traits::{Bounded, Float, NumCast, One, Zero};
 use polars_utils::float::IsFloat;
@@ -12,7 +12,7 @@ use polars_utils::ord::{compare_fn_nan_max, compare_fn_nan_min};
 use serde::{Deserialize, Serialize};
 use window::*;
 
-use crate::array::{ArrayRef, PrimitiveArray};
+use crate::array::{ArrayRef, BooleanArray, PrimitiveArray};
 use crate::bitmap::{Bitmap, MutableBitmap};
 use crate::legacy::prelude::*;
 use crate::legacy::utils::CustomIterTools;
