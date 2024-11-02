@@ -11,6 +11,7 @@ use num_traits::{Float, Num, NumCast};
 pub use quantile::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use strum_macros::IntoStaticStr;
 pub use sum::*;
 pub use variance::*;
 
@@ -116,16 +117,58 @@ where
     Ok(Box::new(arr))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+// Use an aggregation window that maintains the state
+pub(super) fn rolling_apply_agg_window_bool<'a, Agg, Fo>(
+    values: &'a Bitmap,
+    window_size: usize,
+    min_periods: usize,
+    det_offsets_fn: Fo,
+) -> PolarsResult<ArrayRef>
+where
+    Fo: Fn(Idx, WindowSize, Len) -> (Start, End),
+    Agg: RollingAggWindowBoolNoNulls<'a>,
+{
+    let len = values.len();
+    let (start, end) = det_offsets_fn(0, window_size, len);
+    let mut agg_window = Agg::new(values, start, end);
+    if let Some(validity) = create_validity(min_periods, len, window_size, &det_offsets_fn) {
+        if validity.iter().all(|x| !x) {
+            return Ok(Box::new(BooleanArray::new_null(
+                ArrowDataType::Boolean,
+                len,
+            )));
+        }
+    }
+
+    let out = (0..len).map(|idx| {
+        let (start, end) = det_offsets_fn(idx, window_size, len);
+        if end - start < min_periods {
+            None
+        } else {
+            // SAFETY:
+            // we are in bounds
+            unsafe { agg_window.update(start, end) }
+        }
+    });
+    let arr = BooleanArray::from_trusted_len_iter(out);
+    Ok(Box::new(arr))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash, IntoStaticStr)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum QuantileInterpolOptions {
+#[strum(serialize_all = "snake_case")]
+pub enum QuantileMethod {
     #[default]
     Nearest,
     Lower,
     Higher,
     Midpoint,
     Linear,
+    Equiprobable,
 }
+
+#[deprecated(note = "use QuantileMethod instead")]
+pub type QuantileInterpolOptions = QuantileMethod;
 
 pub(super) fn rolling_apply_weights<T, Fo, Fa>(
     values: &[T],
