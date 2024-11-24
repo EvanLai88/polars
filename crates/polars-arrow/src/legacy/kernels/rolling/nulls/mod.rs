@@ -11,6 +11,7 @@ pub use sum::*;
 pub use variance::*;
 
 use super::*;
+use crate::bitmap::utils::count_zeros;
 use crate::datatypes::ArrowDataType;
 
 pub trait RollingAggWindowNulls<'a, T: NativeType> {
@@ -31,21 +32,14 @@ pub trait RollingAggWindowNulls<'a, T: NativeType> {
     fn is_valid(&self, min_periods: usize) -> bool;
 }
 
-pub trait RollingAggWindowBoolNulls<'a> {
-    /// # Safety
-    /// `start` and `end` must be in bounds for `slice` and `validity`
-    unsafe fn new(
-        slice: &'a Bitmap,
-        validity: &'a Bitmap,
-        start: usize,
-        end: usize,
-    ) -> Self;
-
-    /// # Safety
-    /// `start` and `end` must be in bounds of `slice` and `bitmap`
-    unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool>;
-
-    fn is_valid(&self, min_periods: usize) -> bool;
+pub trait RollingAggWindowBoolNulls<Fo: Fn(Idx, WindowSize, Len) -> (Start, End)> {
+    /// Compute rolling window with original validity
+    fn result_values(
+        bitmap: &Bitmap,
+        validity: &Bitmap,
+        window_size: WindowSize,
+        det_effects_fn: Fo,
+    ) -> Bitmap;
 }
 
 // Use an aggregation window that maintains the state
@@ -112,53 +106,40 @@ pub(super) fn rolling_apply_agg_window_bool<'a, Agg, Fo>(
     window_size: usize,
     min_periods: usize,
     det_offsets_fn: Fo,
+    det_effects_fn: Fo,
 ) -> ArrayRef
 where
     Fo: Fn(Idx, WindowSize, Len) -> (Start, End) + Copy,
-    Agg: RollingAggWindowBoolNulls<'a>,
+    Agg: RollingAggWindowBoolNulls<Fo>,
 {
+    let out = Agg::result_values(values, validity, window_size, det_effects_fn);
+
     let len = values.len();
-    let (start, end) = det_offsets_fn(0, window_size, len);
-    // SAFETY; we are in bounds
-    let mut agg_window = unsafe { Agg::new(values, validity, start, end) };
+    let mut new_validity = create_validity(min_periods, len, window_size, det_offsets_fn)
+        .unwrap_or_else(|| MutableBitmap::from_len_set(len));
 
-    let mut validity = create_validity(min_periods, len, window_size, det_offsets_fn)
-        .unwrap_or_else(|| {
-            let mut validity = MutableBitmap::with_capacity(len);
-            validity.extend_constant(len, true);
-            validity
-        });
+    let mut null_cnt = 0;
+    let mut last_start = 0;
+    let mut last_end = 0;
+    let slice = validity.as_slice().0;
 
-    let out = (0..len)
-        .map(|idx| {
-            let (start, end) = det_offsets_fn(idx, window_size, len);
-            // SAFETY:
-            // we are in bounds
-            let agg = unsafe { agg_window.update(start, end) };
-            match agg {
-                Some(val) => {
-                    if agg_window.is_valid(min_periods) {
-                        val
-                    } else {
-                        // SAFETY: we are in bounds
-                        unsafe { validity.set_unchecked(idx, false) };
-                        bool::default()
-                    }
-                },
-                None => {
-                    // SAFETY: we are in bounds
-                    unsafe { validity.set_unchecked(idx, false) };
-                    bool::default()
-                },
-            }
-        })
-        .collect_trusted::<Vec<_>>();
+    for idx in 0..len {
+        let (start, end) = det_offsets_fn(idx, window_size, len);
 
-    Box::new(BooleanArray::new(
-        ArrowDataType::Boolean,
-        out.into(),
-        Some(validity.into()),
-    ))
+        null_cnt -= count_zeros(slice, last_start, start - last_start);
+        null_cnt += count_zeros(slice, last_end, end - last_end);
+
+        if (end - start) - null_cnt < min_periods {
+            new_validity.set(idx, false);
+        }
+
+        last_start = start;
+        last_end = end;
+    }
+
+    let new_validity = new_validity.freeze();
+
+    BooleanArray::new(ArrowDataType::Boolean, out, Some(new_validity)).boxed()
 }
 
 #[cfg(test)]

@@ -58,34 +58,35 @@ where
     Series::try_from((ca.name().clone(), arr))
 }
 
-macro_rules! rolling_agg_bool {
-    ($ca:tt, $options:tt, $rolling_agg_fn:path, $rolling_agg_fn_nulls:path) => {
-        {
-            polars_ensure!($options.min_periods <= $options.window_size, InvalidOperation: "`min_periods` should be <= `window_size`");
-            if $ca.is_empty() {
-                return Ok(Series::new_empty($ca.name().clone(), $ca.dtype()));
-            }
-            let $ca: BooleanChunked = $ca.rechunk();
+#[cfg(feature = "rolling_window")]
+fn rolling_agg_bool(
+    ca: &BooleanChunked,
+    options: RollingOptionsFixedWindow,
+    rolling_agg_fn: &dyn Fn(&Bitmap, usize, usize, bool) -> ArrayRef,
+    rolling_agg_fn_nulls: &dyn Fn(&BooleanArray, usize, usize, bool) -> ArrayRef,
+) -> PolarsResult<Series> {
+    polars_ensure!(options.min_periods <= options.window_size, InvalidOperation: "`min_periods` should be <= `window_size`");
+    if ca.is_empty() {
+        return Ok(Series::new_empty(ca.name().clone(), ca.dtype()));
+    }
+    let ca = ca.rechunk();
 
-            let arr: &BooleanArray = $ca.downcast_iter().next().unwrap();
-            let arr: ArrayRef = match $ca.null_count() {
-                0 => $rolling_agg_fn(
-                    arr.values(),
-                    $options.window_size,
-                    $options.min_periods,
-                    $options.center,
-                )?,
-                _ =>
-                    $rolling_agg_fn_nulls(
-                        arr,
-                        $options.window_size,
-                        $options.min_periods,
-                        $options.center,
-                    )
-            };
-            Series::try_from(($ca.name().clone(), arr))
-        }
+    let arr = ca.downcast_iter().next().unwrap();
+    let arr = match ca.null_count() {
+        0 => rolling_agg_fn(
+            arr.values(),
+            options.window_size,
+            options.min_periods,
+            options.center,
+        ),
+        _ => rolling_agg_fn_nulls(
+            arr,
+            options.window_size,
+            options.min_periods,
+            options.center,
+        ),
     };
+    Series::try_from((ca.name().clone(), arr))
 }
 
 #[cfg(feature = "rolling_window_by")]
@@ -168,6 +169,97 @@ where
         let arr = ca.downcast_iter().next().unwrap();
         let by_values = by.cont_slice().unwrap();
         let values = arr.values().as_slice();
+        func(
+            values,
+            options.window_size,
+            by_values,
+            options.closed_window,
+            options.min_periods,
+            tu,
+            tz.as_ref(),
+            options.fn_params,
+            Some(sorting_indices.cont_slice().unwrap()),
+        )?
+    };
+    Series::try_from((ca.name().clone(), out))
+}
+
+#[cfg(feature = "rolling_window_by")]
+fn rolling_agg_by_bool(
+    ca: &BooleanChunked,
+    by: &Series,
+    options: RollingOptionsDynamicWindow,
+    rolling_agg_fn_dynamic: &dyn Fn(
+        &Bitmap,
+        Duration,
+        &[i64],
+        ClosedWindow,
+        usize,
+        TimeUnit,
+        Option<&TimeZone>,
+        Option<RollingFnParams>,
+        Option<&[IdxSize]>,
+    ) -> PolarsResult<ArrayRef>,
+) -> PolarsResult<Series> {
+    if ca.is_empty() {
+        return Ok(Series::new_empty(ca.name().clone(), ca.dtype()));
+    }
+    polars_ensure!(by.null_count() == 0 && ca.null_count() == 0, InvalidOperation: "'Expr.rolling_*_by(...)' not yet supported for series with null values, consider using 'DataFrame.rolling' or 'Expr.rolling'");
+    polars_ensure!(ca.len() == by.len(), InvalidOperation: "`by` column in `rolling_*_by` must be the same length as values column");
+    ensure_duration_matches_dtype(options.window_size, by.dtype(), "window_size")?;
+    polars_ensure!(!options.window_size.is_zero() && !options.window_size.negative, InvalidOperation: "`window_size` must be strictly positive");
+    let (by, tz) = match by.dtype() {
+        DataType::Datetime(tu, tz) => (by.cast(&DataType::Datetime(*tu, None))?, tz),
+        DataType::Date => (
+            by.cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?,
+            &None,
+        ),
+        DataType::Int64 => (
+            by.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))?,
+            &None,
+        ),
+        DataType::Int32 | DataType::UInt64 | DataType::UInt32 => (
+            by.cast(&DataType::Int64)?
+                .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))?,
+            &None,
+        ),
+        dt => polars_bail!(InvalidOperation:
+            "in `rolling_*_by` operation, `by` argument of dtype `{}` is not supported (expected `{}`)",
+            dt,
+            "Date/Datetime/Int64/Int32/UInt64/UInt32"),
+    };
+    let ca = ca.rechunk();
+    let by = by.rechunk();
+    let by_is_sorted = by.is_sorted(SortOptions {
+        descending: false,
+        ..Default::default()
+    })?;
+    let by = by.datetime().unwrap();
+    let tu = by.time_unit();
+
+    let func = rolling_agg_fn_dynamic;
+    let out: ArrayRef = if by_is_sorted {
+        let arr = ca.downcast_iter().next().unwrap();
+        let by_values = by.cont_slice().unwrap();
+        let values = arr.values();
+        func(
+            values,
+            options.window_size,
+            by_values,
+            options.closed_window,
+            options.min_periods,
+            tu,
+            tz.as_ref(),
+            options.fn_params,
+            None,
+        )?
+    } else {
+        let sorting_indices = by.arg_sort(Default::default());
+        let ca = unsafe { ca.take_unchecked(&sorting_indices) };
+        let by = unsafe { by.take_unchecked(&sorting_indices) };
+        let arr = ca.downcast_iter().next().unwrap();
+        let by_values = by.cont_slice().unwrap();
+        let values = arr.values();
         func(
             values,
             options.window_size,
@@ -336,11 +428,11 @@ pub trait SeriesOpsTime: AsSeries {
         match s.dtype() {
             DataType::Boolean => {
                 let ca: &BooleanChunked = s.as_ref().as_ref().as_ref();
-                rolling_agg_bool!(
+                rolling_agg_bool(
                     ca,
                     options,
-                    rolling::no_nulls::rolling_min_bool,
-                    rolling::nulls::rolling_min_bool
+                    &rolling::no_nulls::rolling_min_bool,
+                    &rolling::nulls::rolling_min_bool,
                 )
             },
             dt if dt.is_numeric() => {
@@ -398,11 +490,11 @@ pub trait SeriesOpsTime: AsSeries {
         match s.dtype() {
             DataType::Boolean => {
                 let ca: &BooleanChunked = s.as_ref().as_ref().as_ref();
-                rolling_agg_bool!(
+                rolling_agg_bool(
                     ca,
                     options,
-                    rolling::no_nulls::rolling_max_bool,
-                    rolling::nulls::rolling_max_bool
+                    &rolling::no_nulls::rolling_max_bool,
+                    &rolling::nulls::rolling_max_bool,
                 )
             },
             dt if dt.is_numeric() => {

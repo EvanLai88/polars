@@ -1,3 +1,5 @@
+use no_nulls::RollingAggWindowBoolNoNulls;
+
 use super::*;
 use crate::array::iterator::NonNullValuesIter;
 use crate::bitmap::utils::count_zeros;
@@ -248,225 +250,6 @@ impl<'a, T: NativeType + IsFloat + PartialOrd> MinMaxWindow<'a, T> {
     }
 }
 
-pub struct MinMaxWindowBool<'a> {
-    bitmap: &'a Bitmap,
-    validity: &'a Bitmap,
-    extremum: Option<bool>,
-    extremum_idx: Option<usize>,
-    last_start: usize,
-    last_end: usize,
-    null_count: usize,
-    is_better: fn(bool, bool) -> bool,
-    // ordering on which the window needs to act.
-    // for min kernel this is Less
-    // for max kernel this is Greater
-}
-
-impl<'a> MinMaxWindowBool<'a> {
-    #[inline]
-    unsafe fn update_extremum_and_idx(&mut self, extremum_and_idx: Option<(usize, bool)>) {
-        match extremum_and_idx {
-            Some(extremum_and_idx) => {
-                self.extremum = Some(extremum_and_idx.1);
-                self.extremum_idx = Some(extremum_and_idx.0);
-            },
-            None => {
-                self.extremum = None;
-                self.extremum_idx = None;
-            },
-        }
-    }
-
-    unsafe fn compute_extremum_in_between_leaving_and_entering(
-        &self,
-        start: usize,
-    ) -> Option<(usize, bool)> {
-        // check the values in between the window that remains e.g. is not leaving
-        // this between `start..last_end`
-        //
-        // because we know the current `min` (which might be leaving), we know we can stop
-        // searching if any value is equal to current `min`.
-        let mut extremum_in_between = None;
-        let validity_iter = self.validity.clone().sliced(start, self.last_end - start);
-        for slice_idx in validity_iter.true_idx_iter() {
-            let idx = start + slice_idx;
-            let value = self.bitmap.get_bit_unchecked(idx);
-
-            // early return
-            if let Some(current_min) = self.extremum {
-                if value == current_min {
-                    return Some((idx, current_min));
-                }
-            }
-
-            match extremum_in_between {
-                None => extremum_in_between = Some((idx, value)),
-                Some(current) => {
-                    if (self.is_better)(value, current.1) {
-                        extremum_in_between = Some((idx, value))
-                    }
-                },
-            }
-        }
-        extremum_in_between
-    }
-
-    // compute min from the entire window
-    unsafe fn compute_extremum_and_update_null_count(
-        &mut self,
-        start: usize,
-        end: usize,
-    ) -> Option<(usize, bool)> {
-        let mut extremum = None;
-        for idx in start..end {
-            let valid = self.validity.get_bit_unchecked(idx);
-            if valid {
-                let value = self.bitmap.get_bit_unchecked(idx);
-                match extremum {
-                    None => extremum = Some((idx, value)),
-                    Some(current) => {
-                        if (self.is_better)(value, current.1) {
-                            extremum = Some((idx, value))
-                        }
-                    },
-                }
-            } else {
-                self.null_count += 1;
-            }
-        }
-        extremum
-    }
-
-    unsafe fn new(
-        bitmap: &'a Bitmap,
-        validity: &'a Bitmap,
-        start: usize,
-        end: usize,
-        is_better: fn(bool, bool) -> bool,
-    ) -> Self {
-        let mut out = Self {
-            bitmap,
-            validity,
-            extremum: None,
-            extremum_idx: None,
-            last_start: start,
-            last_end: end,
-            null_count: 0,
-            is_better,
-        };
-        let extremum_and_idx = out.compute_extremum_and_update_null_count(start, end);
-        out.update_extremum_and_idx(extremum_and_idx);
-        out
-    }
-
-    unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool> {
-        // recompute min in entering window
-        if start >= self.last_end {
-            let extremum_and_idx = self.compute_extremum_and_update_null_count(start, end);
-            self.update_extremum_and_idx(extremum_and_idx);
-            self.last_end = end;
-            self.last_start = start;
-            return self.extremum;
-        }
-
-        // remove elements that should leave the window
-        self.null_count -= self
-            .validity
-            .clone()
-            .sliced_unchecked(self.last_start, start - self.last_start)
-            .unset_bits();
-
-        // // remove elements that should leave the window
-        // let mut recompute_extremum = false;
-        // for idx in self.last_start..start {
-        //     // SAFETY:
-        //     // we are in bounds
-        //     let valid = self.validity.get_bit_unchecked(idx);
-        //     if valid {
-        //         let leaving_value = self.bitmap.get_bit_unchecked(idx);
-
-        //         // if the leaving value is the
-        //         // min value, we need to recompute the min.
-        //         if leaving_value == self.extremum.unwrap_unchecked() {
-        //             recompute_extremum = true;
-        //             break;
-        //         }
-        //     } else {
-        //         // null value leaving the window
-        //         self.null_count -= 1;
-
-        //         // self.min is None and the leaving value is None
-        //         // if the entering value is valid, we might get a new min.
-        //         if self.extremum.is_none() {
-        //             recompute_extremum = true;
-        //             break;
-        //         }
-        //     }
-        // }
-
-        // overlaps
-        let entering_extremum = self.compute_extremum_and_update_null_count(self.last_end, end);
-        let current_extremum = match (self.extremum_idx, self.extremum) {
-            (Some(idx), Some(extremum)) => Some((idx, extremum)),
-            (None, None) => None,
-            _ => unreachable!(),
-        };
-
-        match (current_extremum, entering_extremum) {
-            // all remains `None`
-            (None, None) => {},
-            (None, Some(entering_extremum)) => {
-                self.extremum = Some(entering_extremum.1);
-                self.extremum_idx = Some(entering_extremum.0);
-            },
-            // entering min is `None` and the `min` is leaving, so the `in_between` min is the new
-            // minimum.
-            // if min is not leaving, we don't do anything
-            (Some(current_extremum), None) => {
-                if current_extremum.0 < start {
-                    let extremum_and_idx =
-                        self.compute_extremum_in_between_leaving_and_entering(start);
-                    self.update_extremum_and_idx(extremum_and_idx);
-                }
-            },
-            (Some(current_extremum), Some(entering_extremum)) => {
-                // entering <= current
-                if (self.is_better)(entering_extremum.1, current_extremum.1) {
-                    self.extremum = Some(entering_extremum.1);
-                    self.extremum_idx = Some(entering_extremum.0);
-                // entering > current, but leaving
-                } else if current_extremum.0 < start {
-                    // compare in between and entering
-                    let min_in_between =
-                        self.compute_extremum_in_between_leaving_and_entering(start);
-                    match min_in_between {
-                        None => {
-                            self.extremum = Some(entering_extremum.1);
-                            self.extremum_idx = Some(entering_extremum.0);
-                        },
-                        Some(extremum_in_between) => {
-                            if (self.is_better)(entering_extremum.1, extremum_in_between.1) {
-                                self.extremum = Some(entering_extremum.1);
-                                self.extremum_idx = Some(entering_extremum.0);
-                            } else {
-                                self.extremum = Some(extremum_in_between.1);
-                                self.extremum_idx = Some(extremum_in_between.0);
-                            }
-                        },
-                    }
-                }
-            },
-        }
-        self.last_start = start;
-        self.last_end = end;
-        self.extremum
-    }
-
-    fn is_valid(&self, min_periods: usize) -> bool {
-        ((self.last_end - self.last_start) - self.null_count) >= min_periods
-    }
-}
-
 pub struct MinWindow<'a, T: NativeType + PartialOrd + IsFloat> {
     inner: MinMaxWindow<'a, T>,
 }
@@ -625,81 +408,431 @@ where
     }
 }
 
-pub struct MinWindowBool<'a> {
-    inner: MinMaxWindowBool<'a>,
+// pub struct MinMaxWindowBool<'a> {
+//     bitmap: &'a Bitmap,
+//     validity: &'a Bitmap,
+//     extremum: Option<bool>,
+//     extremum_idx: Option<usize>,
+//     last_start: usize,
+//     last_end: usize,
+//     null_count: usize,
+//     is_better: fn(bool, bool) -> bool,
+//     // ordering on which the window needs to act.
+//     // for min kernel this is Less
+//     // for max kernel this is Greater
+// }
+
+// impl<'a> MinMaxWindowBool<'a> {
+//     #[inline]
+//     unsafe fn update_extremum_and_idx(&mut self, extremum_and_idx: Option<(usize, bool)>) {
+//         match extremum_and_idx {
+//             Some(extremum_and_idx) => {
+//                 self.extremum = Some(extremum_and_idx.1);
+//                 self.extremum_idx = Some(extremum_and_idx.0);
+//             },
+//             None => {
+//                 self.extremum = None;
+//                 self.extremum_idx = None;
+//             },
+//         }
+//     }
+
+//     unsafe fn compute_extremum_in_between_leaving_and_entering(
+//         &self,
+//         start: usize,
+//     ) -> Option<(usize, bool)> {
+//         // check the values in between the window that remains e.g. is not leaving
+//         // this between `start..last_end`
+//         //
+//         // because we know the current `min` (which might be leaving), we know we can stop
+//         // searching if any value is equal to current `min`.
+//         let mut extremum_in_between = None;
+//         let validity_iter = self.validity.clone().sliced(start, self.last_end - start);
+//         for slice_idx in validity_iter.true_idx_iter() {
+//             let idx = start + slice_idx;
+//             let value = self.bitmap.get_bit_unchecked(idx);
+
+//             // early return
+//             if let Some(current_min) = self.extremum {
+//                 if value == current_min {
+//                     return Some((idx, current_min));
+//                 }
+//             }
+
+//             match extremum_in_between {
+//                 None => extremum_in_between = Some((idx, value)),
+//                 Some(current) => {
+//                     if (self.is_better)(value, current.1) {
+//                         extremum_in_between = Some((idx, value))
+//                     }
+//                 },
+//             }
+//         }
+//         extremum_in_between
+//     }
+
+//     // compute min from the entire window
+//     unsafe fn compute_extremum_and_update_null_count(
+//         &mut self,
+//         start: usize,
+//         end: usize,
+//     ) -> Option<(usize, bool)> {
+//         let mut extremum = None;
+//         for idx in start..end {
+//             let valid = self.validity.get_bit_unchecked(idx);
+//             if valid {
+//                 let value = self.bitmap.get_bit_unchecked(idx);
+//                 match extremum {
+//                     None => extremum = Some((idx, value)),
+//                     Some(current) => {
+//                         if (self.is_better)(value, current.1) {
+//                             extremum = Some((idx, value))
+//                         }
+//                     },
+//                 }
+//             } else {
+//                 self.null_count += 1;
+//             }
+//         }
+//         extremum
+//     }
+
+//     unsafe fn new(
+//         bitmap: &'a Bitmap,
+//         validity: &'a Bitmap,
+//         start: usize,
+//         end: usize,
+//         is_better: fn(bool, bool) -> bool,
+//     ) -> Self {
+//         let mut out = Self {
+//             bitmap,
+//             validity,
+//             extremum: None,
+//             extremum_idx: None,
+//             last_start: start,
+//             last_end: end,
+//             null_count: 0,
+//             is_better,
+//         };
+//         let extremum_and_idx = out.compute_extremum_and_update_null_count(start, end);
+//         out.update_extremum_and_idx(extremum_and_idx);
+//         out
+//     }
+
+//     unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool> {
+//         // recompute min in entering window
+//         if start >= self.last_end {
+//             let extremum_and_idx = self.compute_extremum_and_update_null_count(start, end);
+//             self.update_extremum_and_idx(extremum_and_idx);
+//             self.last_end = end;
+//             self.last_start = start;
+//             return self.extremum;
+//         }
+
+//         // remove elements that should leave the window
+//         self.null_count -= self
+//             .validity
+//             .clone()
+//             .sliced_unchecked(self.last_start, start - self.last_start)
+//             .unset_bits();
+
+//         // // remove elements that should leave the window
+//         // let mut recompute_extremum = false;
+//         // for idx in self.last_start..start {
+//         //     // SAFETY:
+//         //     // we are in bounds
+//         //     let valid = self.validity.get_bit_unchecked(idx);
+//         //     if valid {
+//         //         let leaving_value = self.bitmap.get_bit_unchecked(idx);
+
+//         //         // if the leaving value is the
+//         //         // min value, we need to recompute the min.
+//         //         if leaving_value == self.extremum.unwrap_unchecked() {
+//         //             recompute_extremum = true;
+//         //             break;
+//         //         }
+//         //     } else {
+//         //         // null value leaving the window
+//         //         self.null_count -= 1;
+
+//         //         // self.min is None and the leaving value is None
+//         //         // if the entering value is valid, we might get a new min.
+//         //         if self.extremum.is_none() {
+//         //             recompute_extremum = true;
+//         //             break;
+//         //         }
+//         //     }
+//         // }
+
+//         // overlaps
+//         let entering_extremum = self.compute_extremum_and_update_null_count(self.last_end, end);
+//         let current_extremum = match (self.extremum_idx, self.extremum) {
+//             (Some(idx), Some(extremum)) => Some((idx, extremum)),
+//             (None, None) => None,
+//             _ => unreachable!(),
+//         };
+
+//         match (current_extremum, entering_extremum) {
+//             // all remains `None`
+//             (None, None) => {},
+//             (None, Some(entering_extremum)) => {
+//                 self.extremum = Some(entering_extremum.1);
+//                 self.extremum_idx = Some(entering_extremum.0);
+//             },
+//             // entering min is `None` and the `min` is leaving, so the `in_between` min is the new
+//             // minimum.
+//             // if min is not leaving, we don't do anything
+//             (Some(current_extremum), None) => {
+//                 if current_extremum.0 < start {
+//                     let extremum_and_idx =
+//                         self.compute_extremum_in_between_leaving_and_entering(start);
+//                     self.update_extremum_and_idx(extremum_and_idx);
+//                 }
+//             },
+//             (Some(current_extremum), Some(entering_extremum)) => {
+//                 // entering <= current
+//                 if (self.is_better)(entering_extremum.1, current_extremum.1) {
+//                     self.extremum = Some(entering_extremum.1);
+//                     self.extremum_idx = Some(entering_extremum.0);
+//                 // entering > current, but leaving
+//                 } else if current_extremum.0 < start {
+//                     // compare in between and entering
+//                     let min_in_between =
+//                         self.compute_extremum_in_between_leaving_and_entering(start);
+//                     match min_in_between {
+//                         None => {
+//                             self.extremum = Some(entering_extremum.1);
+//                             self.extremum_idx = Some(entering_extremum.0);
+//                         },
+//                         Some(extremum_in_between) => {
+//                             if (self.is_better)(entering_extremum.1, extremum_in_between.1) {
+//                                 self.extremum = Some(entering_extremum.1);
+//                                 self.extremum_idx = Some(entering_extremum.0);
+//                             } else {
+//                                 self.extremum = Some(extremum_in_between.1);
+//                                 self.extremum_idx = Some(extremum_in_between.0);
+//                             }
+//                         },
+//                     }
+//                 }
+//             },
+//         }
+//         self.last_start = start;
+//         self.last_end = end;
+//         self.extremum
+//     }
+
+//     fn is_valid(&self, min_periods: usize) -> bool {
+//         ((self.last_end - self.last_start) - self.null_count) >= min_periods
+//     }
+// }
+
+// pub struct MinWindowBool<'a> {
+//     inner: MinMaxWindowBool<'a>,
+// }
+
+// impl<'a> RollingAggWindowBoolNulls<'a> for MinWindowBool<'a> {
+//     unsafe fn new(slice: &'a Bitmap, validity: &'a Bitmap, start: usize, end: usize) -> Self {
+//         Self {
+//             inner: MinMaxWindowBool::new(slice, validity, start, end, |a, b| !a | b),
+//         }
+//     }
+
+//     unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool> {
+//         self.inner.update(start, end)
+//     }
+
+//     fn is_valid(&self, min_periods: usize) -> bool {
+//         self.inner.is_valid(min_periods)
+//     }
+// }
+
+// pub fn rolling_min_bool(
+//     arr: &BooleanArray,
+//     window_size: usize,
+//     min_periods: usize,
+//     center: bool,
+// ) -> ArrayRef {
+//     let offset_fn = match center {
+//         true => det_offsets_center,
+//         false => det_offsets,
+//     };
+
+//     rolling_apply_agg_window_bool::<MinWindowBool, _>(
+//         arr.values(),
+//         arr.validity().as_ref().unwrap(),
+//         window_size,
+//         min_periods,
+//         offset_fn,
+//     )
+// }
+// pub struct MaxWindowBool<'a> {
+//     inner: MinMaxWindowBool<'a>,
+// }
+
+// impl<'a> RollingAggWindowBoolNulls<'a> for MaxWindowBool<'a> {
+//     unsafe fn new(slice: &'a Bitmap, validity: &'a Bitmap, start: usize, end: usize) -> Self {
+//         Self {
+//             inner: MinMaxWindowBool::new(slice, validity, start, end, |a, b| a | !b),
+//         }
+//     }
+
+//     unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool> {
+//         self.inner.update(start, end)
+//     }
+
+//     fn is_valid(&self, min_periods: usize) -> bool {
+//         self.inner.is_valid(min_periods)
+//     }
+// }
+
+pub struct MinWindowBool {}
+
+impl<Fo: Fn(Idx, WindowSize, Len) -> (Start, End)> RollingAggWindowBoolNulls<Fo> for MinWindowBool {
+    fn result_values(
+        bitmap: &Bitmap,
+        validity: &Bitmap,
+        window_size: WindowSize,
+        det_effects_fn: Fo,
+    ) -> Bitmap {
+        // set None to true
+        let bitmap = bitmap | &(!validity);
+
+        no_nulls::MinWindowBool::result_values(&bitmap, window_size, det_effects_fn)
+    }
 }
 
-impl<'a> RollingAggWindowBoolNulls<'a> for MinWindowBool<'a> {
-    unsafe fn new(slice: &'a Bitmap, validity: &'a Bitmap, start: usize, end: usize) -> Self {
-        Self {
-            inner: MinMaxWindowBool::new(slice, validity, start, end, |a, b| !a | b),
+pub struct MaxWindowBool {}
+
+impl<Fo: Fn(Idx, WindowSize, Len) -> (Start, End)> RollingAggWindowBoolNulls<Fo> for MaxWindowBool {
+    fn result_values(
+        bitmap: &Bitmap,
+        validity: &Bitmap,
+        window_size: WindowSize,
+        det_effects_fn: Fo,
+    ) -> Bitmap {
+        // set None to false
+        let bitmap = bitmap & validity;
+
+        no_nulls::MaxWindowBool::result_values(&bitmap, window_size, det_effects_fn)
+    }
+}
+
+macro_rules! rolling_minmax_bool_func {
+    ($rolling_m:ident, $window:tt) => {
+        pub fn $rolling_m(
+            arr: &BooleanArray,
+            window_size: usize,
+            min_periods: usize,
+            center: bool,
+        ) -> ArrayRef {
+            let offset_fn = match center {
+                true => det_offsets_center,
+                false => det_offsets,
+            };
+
+            let effect_fn = match center {
+                true => det_offsets_center,
+                false => |false_idx, window_size, len| {
+                    (false_idx, std::cmp::min(len, false_idx + window_size))
+                },
+            };
+
+            rolling_apply_agg_window_bool::<$window, _>(
+                arr.values(),
+                arr.validity().unwrap(),
+                window_size,
+                min_periods,
+                offset_fn,
+                effect_fn,
+            )
         }
-    }
-
-    unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool> {
-        self.inner.update(start, end)
-    }
-
-    fn is_valid(&self, min_periods: usize) -> bool {
-        self.inner.is_valid(min_periods)
-    }
-}
-
-pub fn rolling_min_bool(
-    arr: &BooleanArray,
-    window_size: usize,
-    min_periods: usize,
-    center: bool,
-) -> ArrayRef {
-    let offset_fn = match center {
-        true => det_offsets_center,
-        false => det_offsets,
     };
-
-    rolling_apply_agg_window_bool::<MinWindowBool, _>(
-        arr.values(),
-        arr.validity().as_ref().unwrap(),
-        window_size,
-        min_periods,
-        offset_fn,
-    )
-}
-pub struct MaxWindowBool<'a> {
-    inner: MinMaxWindowBool<'a>,
 }
 
-impl<'a> RollingAggWindowBoolNulls<'a> for MaxWindowBool<'a> {
-    unsafe fn new(slice: &'a Bitmap, validity: &'a Bitmap, start: usize, end: usize) -> Self {
-        Self {
-            inner: MinMaxWindowBool::new(slice, validity, start, end, |a, b| a | !b),
-        }
-    }
+rolling_minmax_bool_func!(rolling_min_bool, MinWindowBool);
+rolling_minmax_bool_func!(rolling_max_bool, MaxWindowBool);
 
-    unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool> {
-        self.inner.update(start, end)
-    }
+// pub fn rolling_min_bool(
+//     arr: &BooleanArray,
+//     window_size: usize,
+//     min_periods: usize,
+//     center: bool,
+// ) -> ArrayRef {
+//     let offset_fn = match center {
+//         true => det_offsets_center,
+//         false => det_offsets,
+//     };
+//     let effect_fn: fn(usize, usize, usize) -> (usize, usize) = match center {
+//         true => det_offsets_center,
+//         false => {
+//             |false_idx, window_size, len| (false_idx, std::cmp::min(len, false_idx + window_size))
+//         },
+//     };
 
-    fn is_valid(&self, min_periods: usize) -> bool {
-        self.inner.is_valid(min_periods)
-    }
-}
+//     let bitmap = arr.values();
+//     let validity = arr.validity().unwrap();
 
-pub fn rolling_max_bool(
-    arr: &BooleanArray,
-    window_size: usize,
-    min_periods: usize,
-    center: bool,
-) -> ArrayRef {
-    let offset_fn = match center {
-        true => det_offsets_center,
-        false => det_offsets,
-    };
+//     // let mut tmp_bitmap = bitmap.clone().make_mut();
+//     // for idx in validity.not().true_idx_iter() {
+//     //     // test None bits
+//     //     tmp_bitmap.set(idx, false);
+//     // }
 
-    rolling_apply_agg_window_bool::<MaxWindowBool, _>(
-        arr.values(),
-        arr.validity().as_ref().unwrap(),
-        window_size,
-        min_periods,
-        offset_fn,
-    )
-}
+//     let bitmap = &(bitmap | &(!validity));
+
+//     let len = bitmap.len();
+
+//     // set None bits to true.
+//     let bitmap = bitmap | &validity.not();
+
+//     let mut new_validity = create_validity(min_periods, len, window_size, &offset_fn)
+//         .unwrap_or_else(|| {
+//             let mut validity = MutableBitmap::with_capacity(len);
+//             validity.extend_constant(len, true);
+//             validity
+//         });
+
+//     let mut out = MutableBitmap::with_capacity(len);
+//     out.extend_constant(len, true);
+
+//     let value_bitmap = bitmap.not();
+
+//     // values
+//     // loop all false idx
+//     let mut last_end = 0;
+//     for false_idx in value_bitmap.true_idx_iter() {
+//         // window that should be set to false
+//         let (start, end) = if center {
+//             let right_window = (window_size + 1) / 2;
+//             (
+//                 false_idx.saturating_sub(window_size - right_window),
+//                 std::cmp::min(len, false_idx + right_window),
+//             )
+//         } else {
+//             (false_idx, std::cmp::min(len, false_idx + window_size))
+//         };
+
+//         // previous false not in current window
+//         if last_end <= start {
+//             for idx in start..end {
+//                 out.set(idx, false);
+//             }
+//         }
+//         // previous false in current window
+//         else {
+//             for idx in last_end..end {
+//                 out.set(idx, false);
+//             }
+//         }
+//         last_end = end;
+//     }
+
+//     // validity
+//     // TODO: move to create_validity()
+
+//     let out = out.freeze();
+//     let validity = new_validity.freeze();
+
+//     BooleanArray::new(ArrowDataType::Boolean, out, Some(validity)).boxed()
+// }

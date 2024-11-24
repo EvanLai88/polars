@@ -31,14 +31,9 @@ pub trait RollingAggWindowNoNulls<'a, T: NativeType> {
     unsafe fn update(&mut self, start: usize, end: usize) -> Option<T>;
 }
 
-pub trait RollingAggWindowBoolNoNulls<'a> {
-    fn new(slice: &'a Bitmap, start: usize, end: usize) -> Self;
-
-    /// Update and recompute the window
-    ///
-    /// # Safety
-    /// `start` and `end` must be within the windows bounds
-    unsafe fn update(&mut self, start: usize, end: usize) -> Option<bool>;
+pub trait RollingAggWindowBoolNoNulls<Fo: Fn(Idx, WindowSize, Len) -> (Start, End)> {
+    /// Compute rolling window without validity
+    fn result_values(bitmap: &Bitmap, window_size: WindowSize, det_effects_fn: Fo) -> Bitmap;
 }
 
 // Use an aggregation window that maintains the state
@@ -80,78 +75,31 @@ where
     Ok(Box::new(arr))
 }
 
-// Use an aggregation window that maintains the state
+// Use an aggregation window that finds all extremum
 pub(super) fn rolling_apply_agg_window_bool<'a, Agg, Fo>(
     values: &'a Bitmap,
     window_size: usize,
     min_periods: usize,
     det_offsets_fn: Fo,
-) -> PolarsResult<ArrayRef>
+    det_effects_fn: Fo,
+) -> ArrayRef
 where
     Fo: Fn(Idx, WindowSize, Len) -> (Start, End),
-    Agg: RollingAggWindowBoolNoNulls<'a>,
+    Agg: RollingAggWindowBoolNoNulls<Fo>,
 {
     let len = values.len();
-    let (start, end) = det_offsets_fn(0, window_size, len);
-    let mut agg_window = Agg::new(values, start, end);
-    if let Some(validity) = create_validity(min_periods, len, window_size, &det_offsets_fn) {
-        if validity.iter().all(|x| !x) {
-            return Ok(Box::new(BooleanArray::new_null(
-                ArrowDataType::Boolean,
-                len,
-            )));
+    let validity = create_validity(min_periods, len, window_size, det_offsets_fn);
+    if let Some(ref validity) = validity {
+        if validity.set_bits() == 0 {
+            return Box::new(BooleanArray::new_null(ArrowDataType::Boolean, len));
         }
     }
 
-    let out = (0..len).map(|idx| {
-        let (start, end) = det_offsets_fn(idx, window_size, len);
-        if end - start < min_periods {
-            None
-        } else {
-            // SAFETY:
-            // we are in bounds
-            unsafe { agg_window.update(start, end) }
-        }
-    });
-    let arr = BooleanArray::from_trusted_len_iter(out);
-    Ok(Box::new(arr))
-}
+    let out = Agg::result_values(values, window_size, det_effects_fn);
+    let validity = validity.map(MutableBitmap::freeze);
 
-// Use an aggregation window that maintains the state
-pub(super) fn rolling_apply_agg_window_bool<'a, Agg, Fo>(
-    values: &'a Bitmap,
-    window_size: usize,
-    min_periods: usize,
-    det_offsets_fn: Fo,
-) -> PolarsResult<ArrayRef>
-where
-    Fo: Fn(Idx, WindowSize, Len) -> (Start, End),
-    Agg: RollingAggWindowBoolNoNulls<'a>,
-{
-    let len = values.len();
-    let (start, end) = det_offsets_fn(0, window_size, len);
-    let mut agg_window = Agg::new(values, start, end);
-    if let Some(validity) = create_validity(min_periods, len, window_size, &det_offsets_fn) {
-        if validity.iter().all(|x| !x) {
-            return Ok(Box::new(BooleanArray::new_null(
-                ArrowDataType::Boolean,
-                len,
-            )));
-        }
-    }
-
-    let out = (0..len).map(|idx| {
-        let (start, end) = det_offsets_fn(idx, window_size, len);
-        if end - start < min_periods {
-            None
-        } else {
-            // SAFETY:
-            // we are in bounds
-            unsafe { agg_window.update(start, end) }
-        }
-    });
-    let arr = BooleanArray::from_trusted_len_iter(out);
-    Ok(Box::new(arr))
+    // det_effects_fn(0, 0, 0);
+    BooleanArray::new(ArrowDataType::Boolean, out, validity).boxed()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash, IntoStaticStr)]

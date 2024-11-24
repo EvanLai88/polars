@@ -3,7 +3,7 @@ pub mod nulls;
 pub mod quantile_filter;
 mod window;
 
-use std::ops::{Add, AddAssign, Div, Not, Mul, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 
 use num_traits::{Bounded, Float, NumCast, One, Zero};
 use polars_utils::float::IsFloat;
